@@ -285,7 +285,8 @@ function registerTelegramEventHandler(tgClient) {
       if (!message) return;
 
       const chat = message.chat || event.chat;
-      const cleanChannelId = String(message.chatId || message.peerId?.channelId || '')
+      const isChannel = !message.isPrivate;
+      const cleanChannelId = String(message.chatId || message.peerId?.channelId || message.peerId?.userId || '')
         .replace(/^-100/, '')
         .replace(/^-/, '');
       const messageId = message.id;
@@ -294,13 +295,51 @@ function registerTelegramEventHandler(tgClient) {
         knownChannels.set(cleanChannelId, {
           channelId: cleanChannelId,
           accessHash: chat.accessHash.toString(),
-          title: chat.title || ''
+          title: chat.title || chat.firstName || '',
+          isChannel: isChannel
         });
         savePersistedChannels();
       }
 
+      // /start yoki matnli xabarlarni tutish
+      const text = (message.message || '').trim();
+      if (text.startsWith('/start')) {
+        const welcomeHtml =
+          `🎬 <b>Assalomu alaykum! AniMovie S3 Video Streamer botiga xush kelibsiz!</b>\n\n` +
+          `⚡️ <b>Ushbu bot nima qiladi?</b>\n` +
+          `Telegram kanal yoki shaxsiy chatga yuklangan videolarni to'g'ridan-to'g'ri saytingizda <b>qotmasdan va yuqori tezlikda</b> stream qilish uchun havolalar beradi.\n\n` +
+          `📌 <b>Qanday ishlatiladi?</b>\n` +
+          `1️⃣ <b>Kanalda ishlatish (Tavsiya etiladi):</b> Meni video yuklanadigan Telegram kanalingizga <b>admin</b> qiling. Kanalga video tashlanganda avtomatik ravishda tayyor <b>MP4 Direct URL</b> va <b>Iframe kodini</b> beraman.\n` +
+          `2️⃣ <b>Shaxsiy chatda:</b> Menga to'g'ridan-to'g'ri video yuboring yoki kanaldan video forward qiling, sizga havola tayyorlab beraman.\n\n` +
+          `🚀 <i>Hoziroq sinab ko'rish uchun menga biror video yuboring!</i>`;
+
+        try {
+          await tgClient.sendMessage(message.chatId, {
+            message: welcomeHtml,
+            parseMode: 'html',
+            replyTo: messageId
+          });
+        } catch {
+          await tgClient.sendMessage(message.chatId, {
+            message: welcomeHtml,
+            parseMode: 'html'
+          });
+        }
+        console.log(`[Telegram Streamer] /start buyrug'iga javob berildi (chat: ${message.chatId})`);
+        return;
+      }
+
       const mediaInfo = extractMediaFromMessage(message);
-      if (!mediaInfo) return;
+      if (!mediaInfo) {
+        if (message.isPrivate && text) {
+          await tgClient.sendMessage(message.chatId, {
+            message: `ℹ️ <i>Stream havolasini olish uchun menga <b>video</b> yuboring yoki kanalingizga admin qilib qo'shing.</i>`,
+            parseMode: 'html',
+            replyTo: messageId
+          });
+        }
+        return;
+      }
 
       const cacheKey = `${cleanChannelId}_${messageId}`;
       mediaMetaCache.set(cacheKey, mediaInfo);
@@ -332,13 +371,20 @@ function registerTelegramEventHandler(tgClient) {
         `<code>&lt;iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;</code>\n\n` +
         `🚀 <i>Ushbu oqim 1000+ kishiga qotmasdan, lahzada (moov cache orqali) ochiladi!</i>`;
 
-      await tgClient.sendMessage(message.chatId, {
-        message: replyHtml,
-        parseMode: 'html',
-        replyTo: messageId
-      });
+      try {
+        await tgClient.sendMessage(message.chatId, {
+          message: replyHtml,
+          parseMode: 'html',
+          replyTo: messageId
+        });
+      } catch {
+        await tgClient.sendMessage(message.chatId, {
+          message: replyHtml,
+          parseMode: 'html'
+        });
+      }
 
-      console.log(`[Telegram Streamer] Replied with MP4 stream URL for message #${messageId} in channel ${cleanChannelId}`);
+      console.log(`[Telegram Streamer] Replied with MP4 stream URL for message #${messageId} in chat ${cleanChannelId}`);
     } catch (err) {
       console.warn('[Telegram Streamer] Error handling incoming video message:', err?.message || err);
     }
@@ -363,10 +409,17 @@ async function getStreamMetadata(channelId, messageId) {
     let peer;
     const ch = knownChannels.get(cleanId);
     if (ch && ch.accessHash) {
-      peer = new Api.InputPeerChannel({
-        channelId: bigInt(ch.channelId),
-        accessHash: bigInt(ch.accessHash),
-      });
+      if (ch.isChannel === false) {
+        peer = new Api.InputPeerUser({
+          userId: bigInt(ch.channelId),
+          accessHash: bigInt(ch.accessHash),
+        });
+      } else {
+        peer = new Api.InputPeerChannel({
+          channelId: bigInt(ch.channelId),
+          accessHash: bigInt(ch.accessHash),
+        });
+      }
     } else {
       try {
         peer = await tgClient.getInputEntity(normalizedChannelId);
