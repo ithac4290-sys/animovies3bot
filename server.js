@@ -254,10 +254,31 @@ async function getTelegramClient() {
 
     await client.connect();
 
-    const isAuthorized = await client.checkAuthorization().catch(() => false);
+    let isAuthorized = false;
+    try {
+      isAuthorized = await client.checkAuthorization();
+    } catch {
+      isAuthorized = false;
+    }
+
     if (!isAuthorized) {
       console.log('🔄 Telegram bot avtorizatsiyadan o\'tmoqda...');
-      await client.start({ botAuthToken: TG_BOT_TOKEN });
+      try {
+        await client.start({ botAuthToken: TG_BOT_TOKEN });
+      } catch (authErr) {
+        console.warn('⚠️ Mavjud sessiya bilan ulanib bo\'lmadi, yangi toza sessiya yaratilmoqda:', authErr?.message || authErr);
+        if (fs.existsSync(SESSION_FILE)) {
+          try { fs.unlinkSync(SESSION_FILE); } catch {}
+        }
+        client = new TelegramClient(new StringSession(''), TG_API_ID, TG_API_HASH, {
+          connectionRetries: 5,
+          autoReconnect: true,
+          floodSleepThreshold: 60,
+        });
+        await client.connect();
+        await client.start({ botAuthToken: TG_BOT_TOKEN });
+      }
+
       const newSess = client.session.save();
       try {
         fs.writeFileSync(SESSION_FILE, newSess);
