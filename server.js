@@ -14,6 +14,8 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+const { exec } = require('child_process');
 const { EventEmitter } = require('events');
 
 // Global xatoliklar ushlagichi (server to'xtab qolmasligi uchun)
@@ -78,13 +80,21 @@ if (!fs.existsSync(STORAGE_DIR)) {
   fs.mkdirSync(STORAGE_DIR, { recursive: true });
 }
 
+const HLS_DIR = path.join(CACHE_DIR, 'hls');
+if (!fs.existsSync(HLS_DIR)) {
+  fs.mkdirSync(HLS_DIR, { recursive: true });
+}
+
 const SESSION_FILE = path.join(CACHE_DIR, 'session.txt');
 const CHANNELS_FILE = path.join(CACHE_DIR, 'channels.json');
 const METADATA_FILE = path.join(CACHE_DIR, 'metadata.json');
+const STREAM_IDS_FILE = path.join(CACHE_DIR, 'stream_ids.json');
 
 // Keshlar (LRU xotira)
 const mediaMetaCache = new Map();
 const videoHeadCache = new Map(); // Birinchi 4MB moov atom keshi (lahzada boshlash uchun)
+const streamIdMap = new Map(); // streamId -> { channelId, messageId }
+const reverseStreamIdMap = new Map(); // `${channelId}_${messageId}` -> streamId
 
 // Ma'lum kanallar ro'yxati (accessHash saqlash)
 const knownChannels = new Map();
@@ -112,6 +122,16 @@ function loadPersistedData() {
       }
     }
   } catch {}
+
+  try {
+    if (fs.existsSync(STREAM_IDS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STREAM_IDS_FILE, 'utf8'));
+      for (const [sId, info] of Object.entries(data)) {
+        streamIdMap.set(sId, info);
+        reverseStreamIdMap.set(`${info.channelId}_${info.messageId}`, sId);
+      }
+    }
+  } catch {}
 }
 
 function savePersistedChannels() {
@@ -120,6 +140,30 @@ function savePersistedChannels() {
     for (const [k, v] of knownChannels.entries()) obj[k] = v;
     fs.writeFileSync(CHANNELS_FILE, JSON.stringify(obj, null, 2));
   } catch {}
+}
+
+function savePersistedStreamIds() {
+  try {
+    const obj = {};
+    for (const [k, v] of streamIdMap.entries()) obj[k] = v;
+    fs.writeFileSync(STREAM_IDS_FILE, JSON.stringify(obj, null, 2));
+  } catch {}
+}
+
+function getOrCreateStreamId(channelId, messageId) {
+  const cleanId = String(channelId).replace(/^-100/, '').replace(/^-/, '');
+  const key = `${cleanId}_${messageId}`;
+  if (reverseStreamIdMap.has(key)) {
+    return reverseStreamIdMap.get(key);
+  }
+  const timeHex = Date.now().toString(16);
+  const randHex = crypto.randomBytes(2).toString('hex');
+  const streamId = `ext_${timeHex}_${randHex}`;
+
+  streamIdMap.set(streamId, { channelId: cleanId, messageId: String(messageId) });
+  reverseStreamIdMap.set(key, streamId);
+  savePersistedStreamIds();
+  return streamId;
 }
 
 function savePersistedMetadata() {
@@ -345,6 +389,11 @@ async function downloadVideoToDisk(tgClient, meta, cleanChannelId, messageId) {
     if (fs.existsSync(tempPath)) {
       fs.renameSync(tempPath, targetPath);
       console.log(`[Video Saver] ✅ #${messageId} anime video server diskiga to'liq saqlandi: ${targetPath}`);
+
+      // HLS segmentatsiyasini orqa fonda avtomatik boshlash
+      const streamId = getOrCreateStreamId(cleanChannelId, messageId);
+      const hlsOutputDir = path.join(HLS_DIR, streamId);
+      generateHlsSegments(targetPath, hlsOutputDir).catch(() => {});
     }
   } catch (err) {
     console.warn(`[Video Saver] ⚠️ #${messageId} videoni serverga saqlashda xatolik:`, err?.message || err);
@@ -354,6 +403,28 @@ async function downloadVideoToDisk(tgClient, meta, cleanChannelId, messageId) {
   } finally {
     activeDownloads.delete(fileKey);
   }
+}
+
+function generateHlsSegments(inputMp4Path, hlsOutputDir) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(hlsOutputDir)) {
+      fs.mkdirSync(hlsOutputDir, { recursive: true });
+    }
+    const masterPath = path.join(hlsOutputDir, 'master.m3u8');
+    if (fs.existsSync(masterPath)) return resolve(masterPath);
+
+    const segmentPattern = path.join(hlsOutputDir, 'segment_%03d.ts');
+    const cmd = `ffmpeg -y -i "${inputMp4Path}" -c copy -f hls -hls_time 6 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+
+    exec(cmd, (err) => {
+      if (err) {
+        console.warn(`[HLS Transcoder] ⚠️ HLS generatsiyasida ogohlantirish:`, err?.message || err);
+      } else {
+        console.log(`[HLS Transcoder] ✅ HLS master.m3u8 va segmentlar tayyor: ${masterPath}`);
+      }
+      resolve(masterPath);
+    });
+  });
 }
 
 function findChannelForMessage(messageId) {
@@ -377,6 +448,26 @@ function findChannelForMessage(messageId) {
     return Array.from(knownChannels.keys())[0];
   }
   return 'default';
+}
+
+function resolveStreamInfo(param1, param2) {
+  if (param1 && param1.startsWith('ext_') && streamIdMap.has(param1)) {
+    const info = streamIdMap.get(param1);
+    return { channelId: info.channelId, messageId: info.messageId, streamId: param1 };
+  }
+
+  if (param1 && param2) {
+    const streamId = getOrCreateStreamId(param1, param2);
+    return { channelId: param1, messageId: param2, streamId };
+  }
+
+  if (param1 && !param2) {
+    const foundChannel = findChannelForMessage(param1);
+    const streamId = getOrCreateStreamId(foundChannel, param1);
+    return { channelId: foundChannel, messageId: param1, streamId };
+  }
+
+  return { channelId: param1 || 'default', messageId: param2 || '1', streamId: param1 };
 }
 
 // Telegram kanalga video tashlanganda xabar berish
@@ -411,7 +502,7 @@ function registerTelegramEventHandler(tgClient) {
           `⚡️ <b>Ushbu bot nima qiladi?</b>\n` +
           `Telegram kanal yoki shaxsiy chatga yuklangan videolarni to'g'ridan-to'g'ri saytingizda <b>qotmasdan va yuqori tezlikda</b> stream qilish uchun havolalar beradi.\n\n` +
           `📌 <b>Qanday ishlatiladi?</b>\n` +
-          `1️⃣ <b>Kanalda ishlatish (Tavsiya etiladi):</b> Meni video yuklanadigan Telegram kanalingizga <b>admin</b> qiling. Kanalga video tashlanganda avtomatik ravishda tayyor <b>MP4 Direct URL</b> va <b>Iframe kodini</b> beraman.\n` +
+          `1️⃣ <b>Kanalda ishlatish (Tavsiya etiladi):</b> Meni video yuklanadigan Telegram kanalingizga <b>admin</b> qiling. Kanalga video tashlanganda avtomatik ravishda tayyor <b>HLS master.m3u8</b> va <b>Stream URL</b> beraman.\n` +
           `2️⃣ <b>Shaxsiy chatda:</b> Menga to'g'ridan-to'g'ri video yuboring yoki kanaldan video forward qiling, sizga havola tayyorlab beraman.\n\n` +
           `🚀 <i>Hoziroq sinab ko'rish uchun menga biror video yuboring!</i>`;
 
@@ -447,13 +538,15 @@ function registerTelegramEventHandler(tgClient) {
       mediaMetaCache.set(cacheKey, mediaInfo);
       savePersistedMetadata();
 
+      const streamId = getOrCreateStreamId(cleanChannelId, messageId);
+
       // 💾 Avtomatik tarzda videoni server diskiga yuklashni orqa fonda boshlash
       downloadVideoToDisk(tgClient, mediaInfo, cleanChannelId, messageId).catch(() => {});
 
-      const mp4Url = `https://${TG_STREAM_DOMAIN}/api/tgstream/${cleanChannelId}/${messageId}`;
-      const shortStreamUrl = `https://${TG_STREAM_DOMAIN}/stream/${cleanChannelId}/${messageId}`;
-      const embedUrl = `https://${TG_STREAM_DOMAIN}/embed/${cleanChannelId}/${messageId}`;
-      const playerUrl = `https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}`;
+      const hlsMasterUrl = `https://${TG_STREAM_DOMAIN}/stream/${streamId}/master.m3u8`;
+      const directStreamUrl = `https://${TG_STREAM_DOMAIN}/stream/${streamId}`;
+      const embedUrl = `https://${TG_STREAM_DOMAIN}/embed/${streamId}`;
+      const playerUrl = `https://${TG_STREAM_DOMAIN}/player/${streamId}`;
 
       let codecInfo = `🎞 <b>Format:</b> <code>H.264 (AVC)</code> ✅ <i>(Brauzerlarga 100% mos)</i>\n\n`;
       let warningBlock = '';
@@ -472,15 +565,15 @@ function registerTelegramEventHandler(tgClient) {
         `⏱ <b>Davomiyligi:</b> ${formatDuration(mediaInfo.duration)}\n` +
         codecInfo +
         warningBlock +
-        `⚡️ <b>1. Sayt va Pleyer uchun MP4 Stream Havolasi:</b>\n` +
-        `<code>${mp4Url}</code>\n\n` +
-        `🔗 <b>2. Qisqa Stream Havolasi:</b>\n` +
-        `<code>${shortStreamUrl}</code>\n\n` +
+        `⚡️ <b>1. HLS Master Stream Havolasi (.m3u8):</b>\n` +
+        `<code>${hlsMasterUrl}</code>\n\n` +
+        `🔗 <b>2. To'g'ridan-to'g'ri MP4 Stream Havolasi:</b>\n` +
+        `<code>${directStreamUrl}</code>\n\n` +
         `📺 <b>3. Sayt uchun Iframe kodi (Admin panelga qo'yish uchun):</b>\n` +
         `<code>&lt;iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;</code>\n\n` +
-        `🌐 <b>4. Brauzerda To'g'ridan-to'g'ri Ko'rish:</b>\n` +
+        `🌐 <b>4. Brauzer Pleyeri:</b>\n` +
         `<code>${playerUrl}</code>\n\n` +
-        `💾 <b>Server holati:</b> <i>Video avtomatik tarzda VPS server diskiga yuklanmoqda. Server diskidan 10,000+ tomoshabinga 0ms tezlikda, qotmasdan uzatiladi! 🚀</i>`;
+        `💾 <b>Server holati:</b> <i>Video avtomatik tarzda VPS diskiga yuklanib, HLS master.m3u8 va segmentlarga ajratilmoqda.</i>`;
 
       try {
         await tgClient.sendMessage(message.chatId, {
@@ -567,17 +660,20 @@ app.get(['/health', '/ping', '/'], (_req, res) => {
 
 // 1. ULTRA-FAST DIRECT MP4 & DISK STREAM HANDLER (HTTP 206 Partial Content)
 const handleStreamRequest = async (req, res) => {
-  let { channelId, messageId } = req.params;
-  if (!messageId && channelId) {
-    messageId = channelId;
-    channelId = findChannelForMessage(messageId);
-  }
+  let param1 = req.params.channelId || req.params.param1 || req.params.streamId;
+  let param2 = req.params.messageId || req.params.param2;
+  if (param2 === 'video.mp4') param2 = null;
+
+  const info = resolveStreamInfo(param1, param2);
+  let channelId = info.channelId;
+  let messageId = info.messageId;
+
   const numMsgId = parseInt(messageId, 10);
   if (!channelId || isNaN(numMsgId)) {
     return res.status(400).json({ error: "Noto'g'ri parametrlar" });
   }
 
-  const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  const cleanId = String(channelId).replace(/^-100/, '').replace(/^-/, '');
   const cacheKey = `${cleanId}_${numMsgId}`;
   const headKey = `${cacheKey}_head`;
   const localVideoPath = path.join(STORAGE_DIR, `${cleanId}_${numMsgId}.mp4`);
@@ -766,28 +862,88 @@ const handleStreamRequest = async (req, res) => {
   }
 };
 
+// 1. ULTRA-FAST DIRECT MP4 & DISK STREAM HANDLER (HTTP 206 Partial Content)
 app.get([
-  '/api/tgstream/:channelId/:messageId',
-  '/api/tgstream/:channelId',
-  '/stream/:channelId/:messageId',
-  '/stream/:channelId',
-  '/video/:channelId/:messageId',
-  '/video/:channelId'
-], handleStreamRequest);
+  '/api/tgstream/:param1/:param2',
+  '/api/tgstream/:param1',
+  '/stream/:param1/:param2',
+  '/stream/:param1',
+  '/video/:param1/:param2',
+  '/video/:param1'
+], (req, res, next) => {
+  if (req.path.endsWith('.m3u8') || req.path.endsWith('.ts')) return next();
+  return handleStreamRequest(req, res);
+});
 
-// 2. EMBED & NATIVE BROWSER PLAYER (To'g'ridan-to'g'ri brauzerda o'ta tezkor o'ynatish)
+// 2. HLS .ts SEGMENT HANDLER
 app.get([
-  '/player/:channelId/:messageId',
-  '/player/:channelId',
-  '/embed/:channelId/:messageId',
-  '/embed/:channelId'
+  '/stream/:streamId/:segmentFile([a-zA-Z0-9_\\-\\.]+\\.ts)',
+  '/hls/:streamId/:segmentFile([a-zA-Z0-9_\\-\\.]+\\.ts)',
+  '/api/tghls/:streamId/:segmentFile([a-zA-Z0-9_\\-\\.]+\\.ts)'
 ], (req, res) => {
-  let { channelId, messageId } = req.params;
-  if (!messageId && channelId) {
-    messageId = channelId;
-    channelId = findChannelForMessage(messageId);
+  const { streamId, segmentFile } = req.params;
+  const segPath = path.join(HLS_DIR, streamId, segmentFile);
+  if (fs.existsSync(segPath)) {
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    return fs.createReadStream(segPath).pipe(res);
   }
-  const mp4Url = `/stream/${channelId}/${messageId}`;
+  return res.status(404).send('Segment not found');
+});
+
+// 3. ULTRA-FAST HLS MASTER MANIFEST (https://a3.animovie.uz/stream/ext_.../master.m3u8)
+app.get([
+  '/stream/:streamId/master.m3u8',
+  '/stream/:param1/:param2/master.m3u8',
+  '/api/tghls/:param1/master.m3u8',
+  '/api/tghls/:param1/:param2/master.m3u8',
+  '/hls/:param1/master.m3u8',
+  '/hls/:param1/:param2/master.m3u8'
+], (req, res) => {
+  const param1 = req.params.streamId || req.params.param1;
+  const param2 = req.params.param2;
+  const info = resolveStreamInfo(param1, param2);
+  const streamId = info.streamId;
+
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Cache-Control', 'public, max-age=120');
+
+  const hlsDir = path.join(HLS_DIR, streamId);
+  const masterPath = path.join(hlsDir, 'master.m3u8');
+
+  if (fs.existsSync(masterPath)) {
+    return res.sendFile(masterPath);
+  }
+
+  // Fallback: segmentlar diskda to'liq hosil bo'lmaguncha darhol ishlaydigan manifest
+  const mp4Url = `/stream/${streamId}/video.mp4`;
+  return res.send(`#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:7200
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:1440.0,
+${mp4Url}
+#EXT-X-ENDLIST`);
+});
+
+// 4. EMBED & NATIVE BROWSER PLAYER (Saytlar, admin panel yoki brauzer uchun)
+app.get([
+  '/player/:param1/:param2',
+  '/player/:param1',
+  '/embed/:param1/:param2',
+  '/embed/:param1'
+], (req, res) => {
+  const param1 = req.params.param1;
+  const param2 = req.params.param2;
+  const info = resolveStreamInfo(param1, param2);
+  const streamId = info.streamId;
+
+  const hlsUrl = `/stream/${streamId}/master.m3u8`;
+  const mp4Url = `/stream/${streamId}`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
@@ -795,60 +951,39 @@ app.get([
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Animem Video Stream</title>
+  <title>AniMovie Stream Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; background: #050508; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; display: flex; align-items: center; justify-content: center; }
     video { width: 100%; height: 100%; max-height: 100vh; object-fit: contain; outline: none; }
   </style>
 </head>
 <body>
-  <video src="${mp4Url}" controls autoplay playsinline preload="metadata"></video>
+  <video id="videoPlayer" controls autoplay playsinline preload="auto"></video>
+  <script>
+    const video = document.getElementById('videoPlayer');
+    const hlsSrc = '${hlsUrl}';
+    const mp4Src = '${mp4Url}';
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+      hls.loadSource(hlsSrc);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, function(event, data) {
+        if (data.fatal) {
+          video.src = mp4Src;
+          video.play().catch(()=>{});
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsSrc;
+    } else {
+      video.src = mp4Src;
+    }
+  </script>
 </body>
 </html>`);
-});
-
-// 3. ULTRA-FAST HLS & BACKWARD COMPATIBILITY
-app.get([
-  '/api/tghls/:channelId/:messageId',
-  '/api/tghls/:channelId/:messageId/*',
-  '/api/tghls/:channelId',
-  '/api/tghls/:channelId/*',
-  '/hls/:channelId/:messageId',
-  '/hls/:channelId/:messageId/*',
-  '/hls/:channelId',
-  '/hls/:channelId/*'
-], (req, res) => {
-  let { channelId, messageId } = req.params;
-  if (!messageId && channelId) {
-    messageId = channelId;
-    channelId = findChannelForMessage(messageId);
-  }
-  const mp4Url = `/stream/${channelId}/${messageId}`;
-  const target = req.url.toLowerCase();
-
-  // Agar mijoz yoki player HLS manifest (.m3u8) so'rasa, darhol to'g'ri manifest qaytaramiz
-  if (target.endsWith('.m3u8') || target.includes('.m3u8')) {
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.send(`#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:7200
-#EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:1440.0,
-${mp4Url}
-#EXT-X-ENDLIST`);
-  }
-
-  // Agar brauzerda ochilgan bo'lsa, to'g'ridan-to'g'ri player sahifasiga yo'naltiramiz
-  if (req.headers.accept && req.headers.accept.includes('text/html')) {
-    return res.redirect(302, `/player/${channelId}/${messageId}`);
-  }
-
-  // Boshqa barcha holatlarda to'g'ridan-to'g'ri MP4 oqimiga yo'naltirish
-  return res.redirect(302, mp4Url);
 });
 
 // ============================================================================
@@ -877,11 +1012,11 @@ function autoCleanVpsStorage() {
       }
     }
 
-    // 2. ./cache papkasidagi eski vaqtinchalik fayllarni tozalash (session va metadata saqlanadi)
+    // 2. ./cache papkasidagi eski vaqtinchalik fayllarni tozalash (session, metadata va hls saqlanadi)
     if (fs.existsSync(CACHE_DIR)) {
       const cacheEntries = fs.readdirSync(CACHE_DIR);
       for (const entry of cacheEntries) {
-        if (entry === 'session.txt' || entry === 'channels.json' || entry === 'metadata.json') {
+        if (entry === 'session.txt' || entry === 'channels.json' || entry === 'metadata.json' || entry === 'stream_ids.json' || entry === 'hls') {
           continue; // Muhim sozlamalarga tegmeymiz
         }
         const fullPath = path.join(CACHE_DIR, entry);
