@@ -65,6 +65,7 @@ const TG_API_HASH = process.env.TG_API_HASH || '';
 const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '';
 const TG_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 'stream.animovie.uz';
 const CACHE_DIR = path.resolve(__dirname, process.env.HLS_CACHE_DIR || 'cache');
+const STORAGE_DIR = path.resolve(__dirname, process.env.STORAGE_DIR || 'videos');
 
 if (!TG_API_ID || !TG_API_HASH || !TG_BOT_TOKEN) {
   console.error('⚠️ Telegram config tugallanmagan. .env da TG_API_ID, TG_API_HASH va TG_STREAM_BOT_TOKEN bo\'lishi kerak.');
@@ -72,6 +73,9 @@ if (!TG_API_ID || !TG_API_HASH || !TG_BOT_TOKEN) {
 
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
+if (!fs.existsSync(STORAGE_DIR)) {
+  fs.mkdirSync(STORAGE_DIR, { recursive: true });
 }
 
 const SESSION_FILE = path.join(CACHE_DIR, 'session.txt');
@@ -298,6 +302,83 @@ async function getTelegramClient() {
   }
 }
 
+// ============================================================================
+// VIDEOLARNI SERVER DISKIGA AVTOMATIK YUKLASH VA KESH QILISH
+// ============================================================================
+const activeDownloads = new Set();
+
+async function downloadVideoToDisk(tgClient, meta, cleanChannelId, messageId) {
+  const fileKey = `${cleanChannelId}_${messageId}`;
+  if (activeDownloads.has(fileKey)) return;
+
+  const targetPath = path.join(STORAGE_DIR, `${cleanChannelId}_${messageId}.mp4`);
+  if (fs.existsSync(targetPath)) return;
+
+  const tempPath = `${targetPath}.temp`;
+  activeDownloads.add(fileKey);
+
+  try {
+    console.log(`[Video Saver] ⏳ #${messageId} anime video server diskiga yuklanmoqda... (Hajmi: ${formatBytes(meta.size)})`);
+    const fileLocation = createDocumentLocation(meta.document);
+    const TG_CHUNK_SIZE = 512 * 1024;
+    const totalChunks = Math.ceil(meta.size / TG_CHUNK_SIZE);
+
+    const downloadStream = tgClient.iterDownload({
+      file: fileLocation,
+      dcId: meta.document.dcId,
+      offset: bigInt(0),
+      limit: totalChunks,
+      chunkSize: TG_CHUNK_SIZE,
+      requestSize: TG_CHUNK_SIZE,
+    });
+
+    const writeStream = fs.createWriteStream(tempPath);
+
+    for await (const chunk of downloadStream) {
+      if (!writeStream.write(chunk)) {
+        await new Promise(resolve => writeStream.once('drain', resolve));
+      }
+    }
+
+    await new Promise(resolve => writeStream.end(resolve));
+
+    if (fs.existsSync(tempPath)) {
+      fs.renameSync(tempPath, targetPath);
+      console.log(`[Video Saver] ✅ #${messageId} anime video server diskiga to'liq saqlandi: ${targetPath}`);
+    }
+  } catch (err) {
+    console.warn(`[Video Saver] ⚠️ #${messageId} videoni serverga saqlashda xatolik:`, err?.message || err);
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {}
+  } finally {
+    activeDownloads.delete(fileKey);
+  }
+}
+
+function findChannelForMessage(messageId) {
+  const numId = String(messageId);
+  for (const key of mediaMetaCache.keys()) {
+    if (key.endsWith(`_${numId}`)) {
+      return key.split('_')[0];
+    }
+  }
+  try {
+    if (fs.existsSync(STORAGE_DIR)) {
+      const files = fs.readdirSync(STORAGE_DIR);
+      for (const f of files) {
+        if (f.endsWith(`_${numId}.mp4`)) {
+          return f.replace(`_${numId}.mp4`, '');
+        }
+      }
+    }
+  } catch {}
+  if (knownChannels.size > 0) {
+    return Array.from(knownChannels.keys())[0];
+  }
+  return 'default';
+}
+
 // Telegram kanalga video tashlanganda xabar berish
 function registerTelegramEventHandler(tgClient) {
   tgClient.addEventHandler(async (event) => {
@@ -366,8 +447,13 @@ function registerTelegramEventHandler(tgClient) {
       mediaMetaCache.set(cacheKey, mediaInfo);
       savePersistedMetadata();
 
+      // 💾 Avtomatik tarzda videoni server diskiga yuklashni orqa fonda boshlash
+      downloadVideoToDisk(tgClient, mediaInfo, cleanChannelId, messageId).catch(() => {});
+
       const mp4Url = `https://${TG_STREAM_DOMAIN}/api/tgstream/${cleanChannelId}/${messageId}`;
+      const shortStreamUrl = `https://${TG_STREAM_DOMAIN}/stream/${cleanChannelId}/${messageId}`;
       const embedUrl = `https://${TG_STREAM_DOMAIN}/embed/${cleanChannelId}/${messageId}`;
+      const playerUrl = `https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}`;
 
       let codecInfo = `🎞 <b>Format:</b> <code>H.264 (AVC)</code> ✅ <i>(Brauzerlarga 100% mos)</i>\n\n`;
       let warningBlock = '';
@@ -380,17 +466,21 @@ function registerTelegramEventHandler(tgClient) {
       }
 
       const replyHtml = 
-        `🎬 <b>Video Muvaffaqiyatli Qabul Qilindi!</b>\n\n` +
+        `🎬 <b>Anime Video Muvaffaqiyatli Qabul Qilindi!</b>\n\n` +
         `📁 <b>Fayl:</b> <code>${mediaInfo.fileName}</code>\n` +
         `⚖️ <b>Hajmi:</b> <b>${formatBytes(mediaInfo.size)}</b>\n` +
         `⏱ <b>Davomiyligi:</b> ${formatDuration(mediaInfo.duration)}\n` +
         codecInfo +
         warningBlock +
-        `⚡️ <b>1. To'g'ridan-to'g'ri MP4 Stream Havolasi:</b>\n` +
+        `⚡️ <b>1. Sayt va Pleyer uchun MP4 Stream Havolasi:</b>\n` +
         `<code>${mp4Url}</code>\n\n` +
-        `📺 <b>2. Sayt uchun Iframe kodi (Admin panelga qo'yish uchun):</b>\n` +
+        `🔗 <b>2. Qisqa Stream Havolasi:</b>\n` +
+        `<code>${shortStreamUrl}</code>\n\n` +
+        `📺 <b>3. Sayt uchun Iframe kodi (Admin panelga qo'yish uchun):</b>\n` +
         `<code>&lt;iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;</code>\n\n` +
-        `🚀 <i>Ushbu oqim 1000+ kishiga qotmasdan, lahzada (moov cache orqali) ochiladi!</i>`;
+        `🌐 <b>4. Brauzerda To'g'ridan-to'g'ri Ko'rish:</b>\n` +
+        `<code>${playerUrl}</code>\n\n` +
+        `💾 <b>Server holati:</b> <i>Video avtomatik tarzda VPS server diskiga yuklanmoqda. Server diskidan 10,000+ tomoshabinga 0ms tezlikda, qotmasdan uzatiladi! 🚀</i>`;
 
       try {
         await tgClient.sendMessage(message.chatId, {
@@ -475,9 +565,13 @@ app.get(['/health', '/ping', '/'], (_req, res) => {
   res.status(200).send("Animem S3 Video Streamer is Running OK (Ultra-Fast MP4 Direct Stream) 🚀");
 });
 
-// 1. ULTRA-FAST DIRECT MP4 STREAM HANDLER (HTTP 206 Partial Content)
-app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
-  const { channelId, messageId } = req.params;
+// 1. ULTRA-FAST DIRECT MP4 & DISK STREAM HANDLER (HTTP 206 Partial Content)
+const handleStreamRequest = async (req, res) => {
+  let { channelId, messageId } = req.params;
+  if (!messageId && channelId) {
+    messageId = channelId;
+    channelId = findChannelForMessage(messageId);
+  }
   const numMsgId = parseInt(messageId, 10);
   if (!channelId || isNaN(numMsgId)) {
     return res.status(400).json({ error: "Noto'g'ri parametrlar" });
@@ -486,15 +580,25 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
   const cacheKey = `${cleanId}_${numMsgId}`;
   const headKey = `${cacheKey}_head`;
+  const localVideoPath = path.join(STORAGE_DIR, `${cleanId}_${numMsgId}.mp4`);
 
   try {
-    const meta = await getStreamMetadata(channelId, numMsgId);
-    if (!meta || !meta.document) {
-      return res.status(404).json({ error: "Video topilmadi yoki o'chirilgan" });
+    let totalSize = 0;
+    let mimeType = 'video/mp4';
+    let meta = null;
+
+    if (fs.existsSync(localVideoPath)) {
+      const stat = fs.statSync(localVideoPath);
+      totalSize = stat.size;
+    } else {
+      meta = await getStreamMetadata(channelId, numMsgId);
+      if (!meta || !meta.document) {
+        return res.status(404).json({ error: "Video topilmadi yoki o'chirilgan" });
+      }
+      totalSize = meta.size;
+      mimeType = meta.mimeType || 'video/mp4';
     }
 
-    const totalSize = meta.size;
-    const mimeType = meta.mimeType || 'video/mp4';
     const rangeHeader = req.headers.range;
 
     // CORS & Range headers
@@ -515,9 +619,8 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     let end = totalSize - 1;
     let isRange = false;
 
-    // Progressive Chunk Limiting: Agar brauzer ochiq diapazon so'rasa, 8MB bo'lib uzatamiz.
-    // Bu 1000 kishi bir vaqtda kirganda server xotirasini va MTProto tarmoq oqimini teng taqsimlaydi!
-    const MAX_CHUNK_BURST = 8 * 1024 * 1024; // 8MB burst limit per request
+    const isLocal = fs.existsSync(localVideoPath);
+    const MAX_CHUNK_BURST = 8 * 1024 * 1024; // 8MB burst limit for Telegram MTProto
 
     if (rangeHeader) {
       const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
@@ -526,11 +629,11 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
         start = parseInt(match[1], 10);
         if (match[2]) {
           end = parseInt(match[2], 10);
-        } else {
+        } else if (!isLocal) {
           end = Math.min(totalSize - 1, start + MAX_CHUNK_BURST - 1);
         }
       }
-    } else {
+    } else if (!isLocal) {
       end = Math.min(totalSize - 1, start + MAX_CHUNK_BURST - 1);
     }
 
@@ -552,7 +655,20 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
 
     if (req.method === 'HEAD') return res.end();
 
-    // ⚡️ INSTANT START: Video boshi (moov atom / metadata) xotirada bo'lsa darhol uzatish (<5ms)
+    // ⚡️ 1. Agar video server diskida bo'lsa — SSD diskdan 0ms da uzatish!
+    if (isLocal) {
+      const fileStream = fs.createReadStream(localVideoPath, { start, end });
+      fileStream.pipe(res);
+      return;
+    }
+
+    // ⚡️ 2. Diskda hali bo'lmasa, uni orqa fonda serverga yuklab olishni boshlash
+    const tgClient = await getTelegramClient();
+    if (meta && !activeDownloads.has(cacheKey)) {
+      downloadVideoToDisk(tgClient, meta, cleanId, numMsgId).catch(() => {});
+    }
+
+    // ⚡️ 3. INSTANT START: Video boshi (moov atom / metadata) xotirada bo'lsa darhol uzatish (<5ms)
     const HEAD_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB moov kesh
     if (start === 0 && videoHeadCache.has(headKey)) {
       const cachedHead = videoHeadCache.get(headKey);
@@ -561,7 +677,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
       }
     }
 
-    const tgClient = await getTelegramClient();
+    // ⚡️ 4. Telegram MTProto orqali oqim uzatish
     const fileLocation = createDocumentLocation(meta.document);
 
     const TG_CHUNK_SIZE = 512 * 1024; // 512 KB Telegram direct chunk
@@ -648,12 +764,30 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     }
     console.error(`[Telegram Streamer] Stream error (${channelId}/${numMsgId}):`, err?.message || err);
   }
-});
+};
+
+app.get([
+  '/api/tgstream/:channelId/:messageId',
+  '/api/tgstream/:channelId',
+  '/stream/:channelId/:messageId',
+  '/stream/:channelId',
+  '/video/:channelId/:messageId',
+  '/video/:channelId'
+], handleStreamRequest);
 
 // 2. EMBED & NATIVE BROWSER PLAYER (To'g'ridan-to'g'ri brauzerda o'ta tezkor o'ynatish)
-app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req, res) => {
-  const { channelId, messageId } = req.params;
-  const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
+app.get([
+  '/player/:channelId/:messageId',
+  '/player/:channelId',
+  '/embed/:channelId/:messageId',
+  '/embed/:channelId'
+], (req, res) => {
+  let { channelId, messageId } = req.params;
+  if (!messageId && channelId) {
+    messageId = channelId;
+    channelId = findChannelForMessage(messageId);
+  }
+  const mp4Url = `/stream/${channelId}/${messageId}`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
@@ -675,9 +809,22 @@ app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req,
 });
 
 // 3. ULTRA-FAST HLS & BACKWARD COMPATIBILITY
-app.get(['/api/tghls/:channelId/:messageId', '/api/tghls/:channelId/:messageId/*'], (req, res) => {
-  const { channelId, messageId } = req.params;
-  const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
+app.get([
+  '/api/tghls/:channelId/:messageId',
+  '/api/tghls/:channelId/:messageId/*',
+  '/api/tghls/:channelId',
+  '/api/tghls/:channelId/*',
+  '/hls/:channelId/:messageId',
+  '/hls/:channelId/:messageId/*',
+  '/hls/:channelId',
+  '/hls/:channelId/*'
+], (req, res) => {
+  let { channelId, messageId } = req.params;
+  if (!messageId && channelId) {
+    messageId = channelId;
+    channelId = findChannelForMessage(messageId);
+  }
+  const mp4Url = `/stream/${channelId}/${messageId}`;
   const target = req.url.toLowerCase();
 
   // Agar mijoz yoki player HLS manifest (.m3u8) so'rasa, darhol to'g'ri manifest qaytaramiz
@@ -730,7 +877,7 @@ function autoCleanVpsStorage() {
       }
     }
 
-    // 2. ./cache papkasidagi eski vaqtinchalik papka va fayllarni tozalash (session va channels saqlanadi)
+    // 2. ./cache papkasidagi eski vaqtinchalik fayllarni tozalash (session va metadata saqlanadi)
     if (fs.existsSync(CACHE_DIR)) {
       const cacheEntries = fs.readdirSync(CACHE_DIR);
       for (const entry of cacheEntries) {
@@ -741,10 +888,9 @@ function autoCleanVpsStorage() {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.isDirectory()) {
-            // Eski video papkalari
             fs.rmSync(fullPath, { recursive: true, force: true });
             deletedFiles++;
-          } else if (entry.endsWith('.ts') || entry.endsWith('.mp4') || entry.endsWith('.part') || entry.endsWith('.m3u8')) {
+          } else if (entry.endsWith('.ts') || entry.endsWith('.part') || entry.endsWith('.m3u8')) {
             freedBytes += stat.size;
             fs.unlinkSync(fullPath);
             deletedFiles++;
@@ -753,7 +899,26 @@ function autoCleanVpsStorage() {
       }
     }
 
-    // 3. Xotiradagi (RAM) keshni me'yorda ushlash
+    // 3. STORAGE_DIR dagi chala qolgan (.temp) fayllarni tozalash (to'liq .mp4 anime videolarga TEGMAYMIZ!)
+    if (fs.existsSync(STORAGE_DIR)) {
+      const videoFiles = fs.readdirSync(STORAGE_DIR);
+      const twoHoursAgo = Date.now() - 2 * 3600 * 1000;
+      for (const vf of videoFiles) {
+        if (vf.endsWith('.temp')) {
+          try {
+            const p = path.join(STORAGE_DIR, vf);
+            const st = fs.statSync(p);
+            if (st.mtimeMs < twoHoursAgo) {
+              freedBytes += st.size;
+              fs.unlinkSync(p);
+              deletedFiles++;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    // 4. Xotiradagi (RAM) keshni me'yorda ushlash
     if (videoHeadCache.size > 150) {
       videoHeadCache.clear();
     }
