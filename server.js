@@ -874,7 +874,7 @@ app.get([
   '/video/:param1/:param2',
   '/video/:param1'
 ], (req, res, next) => {
-  if (req.path.endsWith('.m3u8') || req.path.endsWith('.ts')) return next();
+  if (req.path.endsWith('.m3u8') || req.path.endsWith('.ts') || req.path.includes('/relay')) return next();
   return handleStreamRequest(req, res);
 });
 
