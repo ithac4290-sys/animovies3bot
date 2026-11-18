@@ -433,9 +433,9 @@ async function ensureH264Mp4(filePath) {
 
     return await new Promise((resolve) => {
       // 4 ta OCPU dan foydalangan holda yuqori tezlikda H.264 (AVC) ga o'girish
-      const cmd = `ffmpeg -y -i "${filePath}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -movflags +faststart "${convertedPath}"`;
+      const cmd = `ffmpeg -y -loglevel error -i "${filePath}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -movflags +faststart "${convertedPath}"`;
 
-      exec(cmd, (err) => {
+      exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err) => {
         if (!err && fs.existsSync(convertedPath) && fs.statSync(convertedPath).size > 1000) {
           try {
             fs.unlinkSync(filePath);
@@ -467,15 +467,15 @@ async function generateHlsSegments(inputMp4Path, hlsOutputDir) {
   let cmd = '';
   if (codec === 'h264') {
     // Video H.264 bo'lsa, tezkor bitstream copy (kichik 3s segmentlar bilan lahzada start)
-    cmd = `ffmpeg -y -i "${inputMp4Path}" -c copy -f hls -hls_time 3 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+    cmd = `ffmpeg -y -loglevel error -i "${inputMp4Path}" -c copy -f hls -hls_time 3 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
   } else {
     // Agar video boshqa formatda bo'lsa, segmentlarni darhol H.264 AVC ga aylantirish
     console.log(`[HLS Transcoder] 🔄 HLS segmentlari H.264 (AVC) ga o'girilmoqda...`);
-    cmd = `ffmpeg -y -i "${inputMp4Path}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -f hls -hls_time 3 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+    cmd = `ffmpeg -y -loglevel error -i "${inputMp4Path}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -f hls -hls_time 3 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
   }
 
   return new Promise((resolve) => {
-    exec(cmd, (err) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err) => {
       if (err) {
         console.warn(`[HLS Transcoder] ⚠️ HLS generatsiyasida ogohlantirish:`, err?.message || err);
       } else {
