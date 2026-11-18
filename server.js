@@ -968,6 +968,15 @@ app.get([
   const info = resolveStreamInfo(param1, param2);
   const streamId = info.streamId;
 
+  // ⚡️ Agar foydalanuvchi havolani to'g'ridan-to'g'ri Chrome/brauzer manzil satriga tashlagan bo'lsa:
+  // Desktop brauzerlar .m3u8 ni to'g'ridan-to'g'ri o'ynata olmaydi, shuning uchun pleyerga yo'naltiramiz
+  const isBrowserNav = (req.headers['sec-fetch-dest'] === 'document') || 
+                       (req.headers.accept && req.headers.accept.includes('text/html') && !req.xhr);
+
+  if (isBrowserNav) {
+    return res.redirect(302, `/player/${streamId}`);
+  }
+
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
@@ -1118,16 +1127,25 @@ app.get([
       const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
       hls.loadSource(hlsSrc);
       hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        video.play().catch(function() {
+          video.muted = true;
+          video.play().catch(function(){});
+        });
+      });
       hls.on(Hls.Events.ERROR, function(event, data) {
         if (data.fatal) {
+          console.warn('HLS error, falling back to direct MP4');
           video.src = mp4Src;
-          video.play().catch(()=>{});
+          video.play().catch(function(){});
         }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = hlsSrc;
+      video.play().catch(function(){ video.muted = true; video.play().catch(function(){}); });
     } else {
       video.src = mp4Src;
+      video.play().catch(function(){ video.muted = true; video.play().catch(function(){}); });
     }
   </script>
 </body>
