@@ -893,7 +893,7 @@ app.get([
   return res.status(404).send('Segment not found');
 });
 
-// 3. ULTRA-FAST HLS MASTER MANIFEST (https://a3.animovie.uz/stream/ext_.../master.m3u8)
+// 3. ULTRA-FAST HLS MASTER MANIFEST (e.g. https://s3.animovie.uz/stream/ext_.../master.m3u8)
 app.get([
   '/stream/:streamId/master.m3u8',
   '/stream/:param1/:param2/master.m3u8',
@@ -901,13 +901,13 @@ app.get([
   '/api/tghls/:param1/:param2/master.m3u8',
   '/hls/:param1/master.m3u8',
   '/hls/:param1/:param2/master.m3u8'
-], (req, res) => {
+], async (req, res) => {
   const param1 = req.params.streamId || req.params.param1;
   const param2 = req.params.param2;
   const info = resolveStreamInfo(param1, param2);
   const streamId = info.streamId;
 
-  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   res.setHeader('Cache-Control', 'public, max-age=120');
@@ -915,11 +915,29 @@ app.get([
   const hlsDir = path.join(HLS_DIR, streamId);
   const masterPath = path.join(hlsDir, 'master.m3u8');
 
+  // 1. Agar server diskida mahalliy master.m3u8 mavjud bo'lsa
   if (fs.existsSync(masterPath)) {
     return res.sendFile(masterPath);
   }
 
-  // Fallback: segmentlar diskda to'liq hosil bo'lmaguncha darhol ishlaydigan manifest
+  // 2. Agar tashqi stream bo'lsa (masalan ext_ bilan boshlansa), uni s3.animem.uz dan tekshirib uzatish
+  if (streamId && streamId.startsWith('ext_')) {
+    try {
+      const remoteRes = await fetch(`https://s3.animem.uz/stream/${streamId}/master.m3u8`, {
+        headers: {
+          'Referer': 'https://animem.uz/',
+          'Origin': 'https://animem.uz',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      if (remoteRes.ok) {
+        const text = await remoteRes.text();
+        return res.send(text);
+      }
+    } catch {}
+  }
+
+  // 3. Mahalliy video tayyor bo'lgunicha zaxira HLS manifest
   const mp4Url = `/stream/${streamId}/video.mp4`;
   return res.send(`#EXTM3U
 #EXT-X-VERSION:3
@@ -928,6 +946,75 @@ app.get([
 #EXTINF:1440.0,
 ${mp4Url}
 #EXT-X-ENDLIST`);
+});
+
+// 3.1. HLS RELAY PROXY (/stream/:streamId/relay?url=...)
+app.get([
+  '/stream/:streamId/relay',
+  '/hls/:streamId/relay',
+  '/api/tghls/:streamId/relay'
+], async (req, res) => {
+  const { streamId } = req.params;
+  let targetUrl = req.query.url;
+
+  if (!targetUrl) {
+    return res.status(400).send("url parametri kiritilmagan");
+  }
+
+  // Agar url base64 formatda bo'lsa, uni decode qilish
+  if (targetUrl.startsWith('aHR0cD')) {
+    try {
+      targetUrl = Buffer.from(targetUrl, 'base64').toString('utf8');
+    } catch {}
+  }
+
+  try {
+    const upstreamUrl = targetUrl.startsWith('http') 
+      ? targetUrl 
+      : `https://s3.animem.uz/stream/${streamId}/relay?url=${encodeURIComponent(req.query.url)}`;
+
+    const fetchHeaders = {
+      'Referer': 'https://animem.uz/',
+      'Origin': 'https://animem.uz',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    };
+    if (req.headers.range) {
+      fetchHeaders['Range'] = req.headers.range;
+    }
+
+    const upstreamRes = await fetch(upstreamUrl, { headers: fetchHeaders });
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Authorization, Origin, Accept');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type');
+
+    const contentType = upstreamRes.headers.get('content-type') || '';
+    if (contentType) res.setHeader('Content-Type', contentType);
+
+    const contentLength = upstreamRes.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    const contentRange = upstreamRes.headers.get('content-range');
+    if (contentRange) {
+      res.status(206);
+      res.setHeader('Content-Range', contentRange);
+    } else {
+      res.status(upstreamRes.status);
+    }
+
+    if (contentType.includes('mpegurl') || targetUrl.endsWith('.m3u8')) {
+      const m3u8Text = await upstreamRes.text();
+      return res.send(m3u8Text);
+    }
+
+    // Binary / TS segment / Key bo'lsa oqimni to'g'ridan-to'g'ri o'tkazish
+    const arrayBuffer = await upstreamRes.arrayBuffer();
+    return res.end(Buffer.from(arrayBuffer));
+  } catch (err) {
+    console.error(`[Relay Error] ${streamId}:`, err?.message || err);
+    return res.status(502).send("Relay xatoligi yuz berdi");
+  }
 });
 
 // 4. EMBED & NATIVE BROWSER PLAYER (Saytlar, admin panel yoki brauzer uchun)
