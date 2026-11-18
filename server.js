@@ -451,9 +451,12 @@ function findChannelForMessage(messageId) {
 }
 
 function resolveStreamInfo(param1, param2) {
-  if (param1 && param1.startsWith('ext_') && streamIdMap.has(param1)) {
-    const info = streamIdMap.get(param1);
-    return { channelId: info.channelId, messageId: info.messageId, streamId: param1 };
+  if (param1 && param1.startsWith('ext_')) {
+    if (streamIdMap.has(param1)) {
+      const info = streamIdMap.get(param1);
+      return { channelId: info.channelId, messageId: info.messageId, streamId: param1 };
+    }
+    return { channelId: 'external', messageId: param1, streamId: param1 };
   }
 
   if (param1 && param2) {
