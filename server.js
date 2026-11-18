@@ -390,10 +390,16 @@ async function downloadVideoToDisk(tgClient, meta, cleanChannelId, messageId) {
       fs.renameSync(tempPath, targetPath);
       console.log(`[Video Saver] ✅ #${messageId} anime video server diskiga to'liq saqlandi: ${targetPath}`);
 
-      // HLS segmentatsiyasini orqa fonda avtomatik boshlash
+      // H.264 tekshirish va konvertatsiya qilish + HLS yaratish
       const streamId = getOrCreateStreamId(cleanChannelId, messageId);
       const hlsOutputDir = path.join(HLS_DIR, streamId);
-      generateHlsSegments(targetPath, hlsOutputDir).catch(() => {});
+
+      (async () => {
+        const finalMp4Path = await ensureH264Mp4(targetPath);
+        await generateHlsSegments(finalMp4Path, hlsOutputDir);
+      })().catch((err) => {
+        console.warn(`[Video Processing] ⚠️ #${messageId} H.264/HLS jarayonida xatolik:`, err?.message || err);
+      });
     }
   } catch (err) {
     console.warn(`[Video Saver] ⚠️ #${messageId} videoni serverga saqlashda xatolik:`, err?.message || err);
@@ -405,22 +411,75 @@ async function downloadVideoToDisk(tgClient, meta, cleanChannelId, messageId) {
   }
 }
 
-function generateHlsSegments(inputMp4Path, hlsOutputDir) {
+function getVideoCodec(filePath) {
   return new Promise((resolve) => {
-    if (!fs.existsSync(hlsOutputDir)) {
-      fs.mkdirSync(hlsOutputDir, { recursive: true });
+    exec(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "${filePath}"`, (err, stdout) => {
+      if (err || !stdout) return resolve('unknown');
+      resolve(stdout.trim().toLowerCase());
+    });
+  });
+}
+
+async function ensureH264Mp4(filePath) {
+  try {
+    const codec = await getVideoCodec(filePath);
+    if (codec === 'h264') {
+      console.log(`[Transcoder] ⚡️ Video allaqachon H.264 (AVC) formatida: ${filePath}`);
+      return filePath;
     }
-    const masterPath = path.join(hlsOutputDir, 'master.m3u8');
-    if (fs.existsSync(masterPath)) return resolve(masterPath);
 
-    const segmentPattern = path.join(hlsOutputDir, 'segment_%03d.ts');
-    const cmd = `ffmpeg -y -i "${inputMp4Path}" -c copy -f hls -hls_time 6 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+    console.log(`[Transcoder] 🔄 Video kodeki: ${codec}. H.264 (AVC) formatiga to'liq konvertatsiya boshlandi: ${filePath}`);
+    const convertedPath = filePath.replace(/\.mp4$/, '_h264.mp4');
 
+    return await new Promise((resolve) => {
+      // 4 ta OCPU dan foydalangan holda yuqori tezlikda H.264 (AVC) ga o'girish
+      const cmd = `ffmpeg -y -i "${filePath}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -movflags +faststart "${convertedPath}"`;
+
+      exec(cmd, (err) => {
+        if (!err && fs.existsSync(convertedPath) && fs.statSync(convertedPath).size > 1000) {
+          try {
+            fs.unlinkSync(filePath);
+            fs.renameSync(convertedPath, filePath);
+            console.log(`[Transcoder] ✅ Video muvaffaqiyatli H.264 formatiga o'girildi: ${filePath}`);
+          } catch {}
+        } else {
+          console.warn(`[Transcoder] ⚠️ Konvertatsiya yakunlanmadi, asl fayl ishlatiladi:`, err?.message || err);
+          try { if (fs.existsSync(convertedPath)) fs.unlinkSync(convertedPath); } catch {}
+        }
+        resolve(filePath);
+      });
+    });
+  } catch {
+    return filePath;
+  }
+}
+
+async function generateHlsSegments(inputMp4Path, hlsOutputDir) {
+  if (!fs.existsSync(hlsOutputDir)) {
+    fs.mkdirSync(hlsOutputDir, { recursive: true });
+  }
+  const masterPath = path.join(hlsOutputDir, 'master.m3u8');
+  if (fs.existsSync(masterPath)) return masterPath;
+
+  const codec = await getVideoCodec(inputMp4Path);
+  const segmentPattern = path.join(hlsOutputDir, 'segment_%03d.ts');
+
+  let cmd = '';
+  if (codec === 'h264') {
+    // Video H.264 bo'lsa, tezkor bitstream copy (1-2 soniya)
+    cmd = `ffmpeg -y -i "${inputMp4Path}" -c copy -f hls -hls_time 6 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+  } else {
+    // Agar video boshqa formatda bo'lsa, segmentlarni darhol H.264 AVC ga aylantirish
+    console.log(`[HLS Transcoder] 🔄 HLS segmentlari H.264 (AVC) ga o'girilmoqda...`);
+    cmd = `ffmpeg -y -i "${inputMp4Path}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -f hls -hls_time 6 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+  }
+
+  return new Promise((resolve) => {
     exec(cmd, (err) => {
       if (err) {
         console.warn(`[HLS Transcoder] ⚠️ HLS generatsiyasida ogohlantirish:`, err?.message || err);
       } else {
-        console.log(`[HLS Transcoder] ✅ HLS master.m3u8 va segmentlar tayyor: ${masterPath}`);
+        console.log(`[HLS Transcoder] ✅ HLS master.m3u8 va H.264 segmentlar tayyor: ${masterPath}`);
       }
       resolve(masterPath);
     });
@@ -555,10 +614,9 @@ function registerTelegramEventHandler(tgClient) {
       let warningBlock = '';
 
       if (mediaInfo.isHevc) {
-        codecInfo = `🎞 <b>Format:</b> <code>HEVC (H.265 / x265)</code> ⚠️\n\n`;
+        codecInfo = `🎞 <b>Format:</b> <code>HEVC (H.265) ➡️ H.264 (AVC)</code> 🔄\n\n`;
         warningBlock = 
-          `⚠️ <b>DIQQAT:</b> Ushbu video <b>HEVC (H.265)</b> formatida! Brauzerlar uni faqat audio qilib ochishi mumkin.\n` +
-          `💡 <i>Eng yaxshi tezlik uchun videolarni <b>H.264 (AVC)</b> formatida yuklang!</i>\n\n`;
+          `⚙️ <b>Avtomatik konvertatsiya:</b> Ushbu video serverda barcha brauzerlar va qurilmalarda 100% video ko'rinishi uchun <b>H.264 (AVC)</b> formatiga avtomatik o'girilmoqda.\n\n`;
       }
 
       const replyHtml = 
@@ -576,7 +634,7 @@ function registerTelegramEventHandler(tgClient) {
         `<code>&lt;iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;</code>\n\n` +
         `🌐 <b>4. Brauzer Pleyeri:</b>\n` +
         `<code>${playerUrl}</code>\n\n` +
-        `💾 <b>Server holati:</b> <i>Video avtomatik tarzda VPS diskiga yuklanib, HLS master.m3u8 va segmentlarga ajratilmoqda.</i>`;
+        `💾 <b>Server holati:</b> <i>Video avtomatik tarzda VPS diskiga yuklanib, H.264 (AVC) formatiga moslashtirilmoqda va HLS segmentlarga ajratilmoqda.</i>`;
 
       try {
         await tgClient.sendMessage(message.chatId, {
