@@ -466,12 +466,12 @@ async function generateHlsSegments(inputMp4Path, hlsOutputDir) {
 
   let cmd = '';
   if (codec === 'h264') {
-    // Video H.264 bo'lsa, tezkor bitstream copy (1-2 soniya)
-    cmd = `ffmpeg -y -i "${inputMp4Path}" -c copy -f hls -hls_time 6 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+    // Video H.264 bo'lsa, tezkor bitstream copy (kichik 3s segmentlar bilan lahzada start)
+    cmd = `ffmpeg -y -i "${inputMp4Path}" -c copy -f hls -hls_time 3 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
   } else {
     // Agar video boshqa formatda bo'lsa, segmentlarni darhol H.264 AVC ga aylantirish
     console.log(`[HLS Transcoder] 🔄 HLS segmentlari H.264 (AVC) ga o'girilmoqda...`);
-    cmd = `ffmpeg -y -i "${inputMp4Path}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -f hls -hls_time 6 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
+    cmd = `ffmpeg -y -i "${inputMp4Path}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k -f hls -hls_time 3 -hls_list_size 0 -hls_segment_filename "${segmentPattern}" "${masterPath}"`;
   }
 
   return new Promise((resolve) => {
@@ -936,7 +936,7 @@ app.get([
   return handleStreamRequest(req, res);
 });
 
-// 2. HLS .ts SEGMENT HANDLER
+// 2. HLS .ts SEGMENT HANDLER (Ultra-Fast Static Transfer with Content-Length)
 app.get([
   '/stream/:streamId/:segmentFile([a-zA-Z0-9_\\-\\.]+\\.ts)',
   '/hls/:streamId/:segmentFile([a-zA-Z0-9_\\-\\.]+\\.ts)',
@@ -948,8 +948,10 @@ app.get([
     res.setHeader('Content-Type', 'video/mp2t');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Content-Type, Accept');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    return fs.createReadStream(segPath).pipe(res);
+    return res.sendFile(segPath);
   }
   return res.status(404).send('Segment not found');
 });
@@ -1124,7 +1126,18 @@ app.get([
     const mp4Src = '${mp4Url}';
 
     if (Hls.isSupported()) {
-      const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 30,
+        maxBufferLength: 8,
+        maxMaxBufferLength: 15,
+        maxBufferSize: 30 * 1000 * 1000,
+        startFragPrefetch: true,
+        initialLiveManifestSize: 1,
+        fragLoadingTimeOut: 20000,
+        manifestLoadingTimeOut: 20000
+      });
       hls.loadSource(hlsSrc);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, function() {
@@ -1135,9 +1148,18 @@ app.get([
       });
       hls.on(Hls.Events.ERROR, function(event, data) {
         if (data.fatal) {
-          console.warn('HLS error, falling back to direct MP4');
-          video.src = mp4Src;
-          video.play().catch(function(){});
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              hls.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              hls.recoverMediaError();
+              break;
+            default:
+              video.src = mp4Src;
+              video.play().catch(function(){});
+              break;
+          }
         }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
